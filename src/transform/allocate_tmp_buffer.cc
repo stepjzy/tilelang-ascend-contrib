@@ -690,7 +690,18 @@ WorkspaceSpec GetAscendCWorkspaceSpec(const CallNode *call,
   }
   if (call->op.same_as(tl::ascend_broadcast())) {
     const int64_t bytes = EstimateAscendCBroadcastWorkspaceBytes(call);
-    return bytes == 0 ? NoWorkspace() : RequireWorkspace(byte_dtype, bytes);
+    if (bytes == 0) {
+      return NoWorkspace();
+    }
+    WorkspaceSpec spec = RequireWorkspace(byte_dtype, bytes);
+    spec.vid_workspace_divisor = vid.workspace_divisor;
+    // Reserve the pre-split view: AscendVidReduction halves zero-offset
+    // workspace views, so the shared allocation must carry both halves.
+    if (!HasWorkspaceOperand(call, 3) ||
+        GetAccessPtrOffset(call->args[3]) == 0) {
+      spec.primary_bytes *= vid.workspace_divisor;
+    }
+    return spec;
   }
   if (call->op.same_as(tl::ascend_sort()) ||
       call->op.same_as(tl::ascend_topk())) {
@@ -950,6 +961,34 @@ private:
     }
 
     if (!op->op.same_as(tl::ascend_reduce())) {
+      if (op->op.same_as(tl::ascend_broadcast()) &&
+          spec.vid_workspace_divisor == 2) {
+        // The broadcast tmp view that AscendVidReduction sees is halved for
+        // zero-offset arenas, so a threads=1-sized arena is only half of
+        // what each vid needs; and a region-offset arena points past the
+        // halved allocation entirely (verified: a [32:64] region in a
+        // 64-byte arena reads/writes neighbouring memory at threads=2).
+        // Validate the explicit arena against the pre-split spec instead of
+        // relying on the helper happening to use less staging.
+        const PrimExpr &arena = op->args[tmp_buffer_param_offset];
+        const int64_t arena_offset = GetAccessPtrByteOffset(arena);
+        if (arena_offset != 0) {
+          LOG(FATAL)
+              << "broadcast explicit tmp is a BufferRegion with byte offset "
+              << arena_offset
+              << ": AscendVidReduction halves the arena allocation at "
+                 "threads=2, so the region start points past the per-vid "
+                 "allocation. Use a whole-buffer tmp (or threads=1).";
+        }
+        ICHECK_GE(GetAccessPtrBytes(arena), spec.primary_bytes)
+            << "broadcast explicit tmp arena is too small for threads=2: "
+               "the vid pass halves the zero-offset workspace view, so the "
+               "arena must hold "
+            << spec.primary_bytes
+            << " bytes (twice the per-vid staging need). Got "
+            << GetAccessPtrBytes(arena) << " bytes; enlarge the tmp buffer "
+            << "or use threads=1.";
+      }
       if (target_ == "pto") {
         return ReplaceWorkspace(
             op, tmp_buffer_param_offset,

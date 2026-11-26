@@ -84,6 +84,15 @@ public:
             }
           }
           plan.emplace(op, info);
+        } else if (op->op.same_as(tl::ascend_broadcast())) {
+          AscendVidReductionInfo info;
+          if (reduction_.threads_cnt_ == 2) {
+            // The broadcast tmp (explicit or injected) is a one-dimensional
+            // UB view that AscendVidReduction halves, so the allocation must
+            // double it to keep the per-vid staging area usable.
+            info.workspace_divisor = 2;
+          }
+          plan.emplace(op, info);
         }
         StmtExprVisitor::VisitExpr_(op);
       }
@@ -333,7 +342,25 @@ private:
   };
 
   bool NeedsVidReduction(const Buffer &buffer) const {
-    return IsUbBuffer(buffer) && buffers_skip_vid_reduction_.count(buffer) == 0;
+    if (!IsUbBuffer(buffer) || buffers_skip_vid_reduction_.count(buffer) > 0) {
+      return false;
+    }
+    // A buffer whose first dimension is provably 1 has no parallelizable
+    // rows: halving it is meaningless and both side effects are illegal -
+    // the folded access_ptr extent shrinks below the buffer (an
+    // out-of-bounds read for the broadcast helper), and the GM index gains
+    // a vid * 1 offset that reads/writes one row past a [1, N] tensor.
+    // Replicate such buffers instead: both vids compute the identical row
+    // and the GM accesses stay at offset 0 (idempotent same-value writes).
+    if (!buffer->shape.empty()) {
+      PrimExpr first = analyzer_->Simplify(buffer->shape[0]);
+      if (const IntImmNode *imm = first.as<IntImmNode>()) {
+        if (imm->value == 1) {
+          return false;
+        }
+      }
+    }
+    return true;
   }
 
   void AnalyzeBlockBuffers(const Array<Buffer> &alloc_buffers,
@@ -363,6 +390,232 @@ private:
           return IndicesContainUbBufferLoad(indices, ub_set);
         });
     analyzer(body);
+
+    // Mark broadcast operands whose first dimension is a data axis rather
+    // than a parallelizable axis: they must be replicated across vids
+    // instead of being halved.
+    CollectVidReplicateBroadcasts(body);
+  }
+
+  // Mark UB buffers used by tl.ascend_broadcast that must be replicated
+  // (kept at full size on both vids) instead of halved:
+  //  1. The source operand of a true axis=0 broadcast (src[0] == 1,
+  //     dst[0] > 1, i.e. [1, N] -> [M, N]): the source row is identical for
+  //     both halves of the destination, so every vid needs the full [N]
+  //     source to build its half.
+  //  2. The destination of a true one-dimensional broadcast (src[0] == 1,
+  //     [1] -> [N]): the single axis is the data axis, and replicating it
+  //     keeps the GM write-back an idempotent full-width store on both
+  //     vids.
+  // A broadcast whose src and dst shapes match (the frontend allows this as
+  // a copy-shaped broadcast) is NOT replicated: both operands halve along
+  // the row axis and each vid copies its own half, which keeps the trailing
+  // shapes equal so the copy semantics survive.
+  void CollectVidReplicateBroadcasts(const Stmt &body) {
+    class ReplicateBroadcastCollector : public StmtExprVisitor {
+    public:
+      explicit ReplicateBroadcastCollector(AscendVidReduction &reduction)
+          : reduction_(reduction) {}
+
+      void VisitExpr_(const CallNode *op) final {
+        if (op->op.same_as(tl::ascend_broadcast())) {
+          HandleBroadcast(op);
+        }
+        StmtExprVisitor::VisitExpr_(op);
+      }
+
+    private:
+      static int ParseTemplateInt(const StringImm &tmpl, size_t param_index) {
+        const std::string &value = tmpl->value;
+        size_t start = value.find('<');
+        size_t end = value.rfind('>');
+        if (start == std::string::npos || end == std::string::npos ||
+            start >= end) {
+          return -1;
+        }
+        std::string content = value.substr(start + 1, end - start - 1);
+        std::stringstream ss(content);
+        std::string part;
+        for (size_t i = 0; i <= param_index; ++i) {
+          if (!std::getline(ss, part, ',')) {
+            return -1;
+          }
+        }
+        try {
+          return std::stoi(part);
+        } catch (const std::exception &) {
+          return -1;
+        }
+      }
+
+      void HandleBroadcast(const CallNode *op) {
+        // args[0]: "Broadcast<dtype, dim, axis, false>"
+        // args[1]: dst access_ptr, args[2]: src access_ptr,
+        // args[3]: optional tmp access_ptr, then dim, dst extents, src
+        // extents.
+        const auto *tmpl = op->args[0].as<StringImmNode>();
+        if (tmpl == nullptr) {
+          return;
+        }
+        const int axis = ParseTemplateInt(GetRef<StringImm>(tmpl), 2);
+        const size_t dim_index = op->args[3].as<CallNode>() != nullptr ? 4 : 3;
+        const auto *dim_imm = op->args[dim_index].as<IntImmNode>();
+        if (dim_imm == nullptr || dim_imm->value < 1) {
+          return;
+        }
+        const int64_t dim = dim_imm->value;
+        // The trailing extents are the normalized shapes (a 1-D [K] source
+        // passed to a 2-D broadcast is normalized to [1, K]), so they - not
+        // the raw buffer shapes - decide whether this is a true broadcast.
+        const size_t src_extent_index = dim_index + 1 + dim;
+        if (op->args.size() <= src_extent_index) {
+          return;
+        }
+        const auto *src_e0 = op->args[src_extent_index].as<IntImmNode>();
+        const auto *dst_e0 = op->args[dim_index + 1].as<IntImmNode>();
+        if (src_e0 == nullptr || dst_e0 == nullptr) {
+          return;
+        }
+
+        if (axis == 0 && src_e0->value == 1 && dst_e0->value > 1) {
+          Buffer src_buf = reduction_.ExtractUbBufferFromArg(op->args[2]);
+          if (src_buf.defined() && reduction_.IsUbBuffer(src_buf)) {
+            // True row broadcast ([1, N] -> [M, N]): each vid must hold the
+            // full source row. A same-shape broadcast (src[0] == dst[0]) is
+            // a copy and must NOT be replicated: both operands halve along
+            // the rows so the per-vid halves stay aligned and the trailing
+            // shapes stay equal.
+            reduction_.buffers_skip_vid_reduction_.insert(src_buf);
+          }
+        }
+
+        if (dim == 1 && src_e0->value == 1) {
+          Buffer dst_buf = reduction_.ExtractUbBufferFromArg(op->args[1]);
+          if (dst_buf.defined() && reduction_.IsUbBuffer(dst_buf)) {
+            // True one-dimensional broadcast ([1] -> [N]): the single
+            // destination axis is a data axis. A same-shape one-dimensional
+            // broadcast ([N] -> [N]) is a copy and halves normally.
+            reduction_.buffers_skip_vid_reduction_.insert(dst_buf);
+          }
+        }
+      }
+
+      AscendVidReduction &reduction_;
+    };
+
+    ReplicateBroadcastCollector collector(*this);
+    collector(body);
+
+    // Propagate the replicate semantics through the producers of the
+    // replicated buffers: a tile op that writes a replicated buffer must
+    // itself run at full width on both vids, which requires its UB inputs
+    // to be replicated too (they otherwise halve, and the op's halved size
+    // only fills half of the replicated destination).
+    PropagateReplicateThroughProducers(body);
+  }
+
+  // Iteratively replicate the UB inputs of every tile op whose destination
+  // is already replicated, then reject producers whose semantics cannot be
+  // combined with replication: a dim-reduce output and a nested broadcast
+  // destination. Finally reject mixed-vid-semantics consumers: a replicated
+  // buffer read by a tile op whose destination is NOT replicated would see
+  // the full-width view while the op's size is halved, silently changing
+  // which half of the data that consumer processes.
+  void PropagateReplicateThroughProducers(const Stmt &body) {
+    class ProducerVisitor : public StmtExprVisitor {
+    public:
+      explicit ProducerVisitor(AscendVidReduction &reduction)
+          : reduction_(reduction) {}
+
+      // Set each round; iteration stops when nothing is added.
+      bool changed = false;
+
+      void VisitExpr_(const CallNode *op) final {
+        const OpNode *call_op = op->op.as<OpNode>();
+        if (call_op == nullptr) {
+          StmtExprVisitor::VisitExpr_(op);
+          return;
+        }
+        if (reduction_.IsTileOp(call_op->name)) {
+          HandleTileOp(op);
+        } else if (call_op->name == "tl.ascend_reduce") {
+          HandleReduceProducer(op);
+        }
+        // Note: a broadcast whose destination is replicated is legal - the
+        // true one-dimensional broadcast rule itself replicates the
+        // destination, and a nested chain (broadcast -> replicated buffer
+        // -> broadcast) is fully idempotent because every stage runs at
+        // full width on both vids.
+        StmtExprVisitor::VisitExpr_(op);
+      }
+
+    private:
+      void HandleTileOp(const CallNode *op) {
+        // Tile op layout: args[0] is the destination access_ptr, the
+        // trailing arg is the element count, and everything in between is
+        // operand access_ptrs / scalar operands.
+        Buffer dst = reduction_.ExtractUbBufferFromArg(op->args[0]);
+        if (!dst.defined()) {
+          return;
+        }
+        const bool dst_replicated =
+            reduction_.buffers_skip_vid_reduction_.count(dst) > 0;
+        if (dst_replicated) {
+          // Full-width producer: replicate every UB operand.
+          for (size_t i = 1; i + 1 < op->args.size(); ++i) {
+            Buffer in = reduction_.ExtractUbBufferFromArg(op->args[i]);
+            if (in.defined() && reduction_.IsUbBuffer(in) &&
+                reduction_.buffers_skip_vid_reduction_.count(in) == 0) {
+              reduction_.buffers_skip_vid_reduction_.insert(in);
+              changed = true;
+            }
+          }
+        } else {
+          // Mixed-semantics check: a replicated operand feeding a halved
+          // destination changes which half the consumer processes.
+          for (size_t i = 1; i + 1 < op->args.size(); ++i) {
+            Buffer in = reduction_.ExtractUbBufferFromArg(op->args[i]);
+            if (in.defined() &&
+                reduction_.buffers_skip_vid_reduction_.count(in) > 0) {
+              LOG(FATAL)
+                  << "[ascend_vid_reduction] buffer '" << in->name
+                  << "' is replicated (it feeds the replicated broadcast "
+                     "chain) but is also consumed by a tile op whose "
+                     "destination '"
+                  << dst->name
+                  << "' is vid-halved: the two vid semantics conflict. "
+                     "Split the computation or use threads=1.";
+            }
+          }
+        }
+      }
+
+      void HandleReduceProducer(const CallNode *op) {
+        Buffer out = reduction_.ExtractUbBufferFromArg(op->args[1]);
+        if (out.defined() &&
+            reduction_.buffers_skip_vid_reduction_.count(out) > 0) {
+          LOG(FATAL) << "[ascend_vid_reduction] replicated buffer '"
+                     << out->name
+                     << "' is the output of a reduce; the reduce itself is "
+                        "vid-halved while its consumer needs the full "
+                        "width, so the result would be a partial value. "
+                        "Drain the reduce to GM first, or use threads=1.";
+        }
+      }
+
+      AscendVidReduction &reduction_;
+    };
+
+    for (int round = 0; round < 16; ++round) {
+      ProducerVisitor visitor(*this);
+      visitor(body);
+      if (!visitor.changed) {
+        return;
+      }
+    }
+    LOG(FATAL) << "[ascend_vid_reduction] the replicate propagation did "
+                  "not converge within 16 rounds; the broadcast producer "
+                  "chain is too deep. Use threads=1.";
   }
 
   Stmt VisitStmt_(const BlockNode *op) override {
@@ -516,6 +769,27 @@ private:
             for (const auto &pair : origin_to_new_buffer_) {
               if (pair.first->data.get() == var) {
                 return pair.first; // Return original buffer
+              }
+            }
+          }
+        }
+      }
+    }
+    return Buffer();
+  }
+
+  // Extract a UB buffer from a tvm_access_ptr argument by looking it up in
+  // ub_buffers_ (by data var). Unlike ExtractBufferFromArg this works
+  // before origin_to_new_buffer_ is populated, which is required by the
+  // replicate collectors that run before the halving decisions are made.
+  Buffer ExtractUbBufferFromArg(const PrimExpr &arg) const {
+    if (const CallNode *call = arg.as<CallNode>()) {
+      if (call->op.same_as(builtin::tvm_access_ptr())) {
+        if (call->args.size() >= 2) {
+          if (const VarNode *var = call->args[1].as<VarNode>()) {
+            for (const Buffer &buffer : ub_buffers_) {
+              if (buffer->data.get() == var) {
+                return buffer;
               }
             }
           }
@@ -728,6 +1002,122 @@ private:
                 ascend_reduce->span);
   }
 
+  // Modify tl.ascend_broadcast: keep the trailing shape parameters
+  // consistent with the halved buffers.
+  //
+  // Layout: args[0] "Broadcast<dtype, dim, axis, false>", args[1] dst
+  // access_ptr, args[2] src access_ptr, optional args[3] tmp access_ptr,
+  // then dim, dst extents, src extents (all flat IntImm).
+  //
+  // - dst_extent[0] is rewritten from the halved dst buffer shape whenever
+  //   the dst was vid-reduced (both broadcast axes).
+  // - src_extent[0] is rewritten only when the src buffer itself was
+  //   vid-reduced: an axis=0 broadcast replicates the src (skip set, shape
+  //   untouched), while an axis=1 broadcast halves the src together with
+  //   the dst, so its shape must follow.
+  // Refuse a broadcast operand that is a partial BufferRegion (the trailing
+  // shape arguments describe the region, not the buffer, so they cannot be
+  // rebuilt from the halved buffer shape). Only whole buffers (offset 0,
+  // full extent) are supported at threads=2.
+  void CheckBroadcastOperandIsWholeBuffer(const PrimExpr &access_ptr_arg,
+                                          const char *role) const {
+    const auto *call = access_ptr_arg.as<CallNode>();
+    if (call == nullptr || !call->op.same_as(builtin::tvm_access_ptr()) ||
+        call->args.size() < 4) {
+      return;
+    }
+    const auto *offset_imm =
+        analyzer_->Simplify(call->args[2]).as<IntImmNode>();
+    const auto *extent_imm =
+        analyzer_->Simplify(call->args[3]).as<IntImmNode>();
+    if (offset_imm == nullptr || extent_imm == nullptr) {
+      LOG(FATAL) << "[ascend_vid_reduction] broadcast " << role
+                 << " uses a symbolic region offset/extent; only whole "
+                    "buffers are supported at threads=2. Pass the full "
+                    "buffer or use threads=1.";
+    }
+    if (offset_imm->value != 0) {
+      LOG(FATAL) << "[ascend_vid_reduction] broadcast " << role
+                 << " is a BufferRegion with offset " << offset_imm->value
+                 << "; region-based broadcasts cannot be vid-split safely "
+                    "(and fail even at threads=1 on the current baseline). "
+                    "Pass the full buffer or use threads=1.";
+    }
+    Buffer buf = ExtractUbBufferFromArg(access_ptr_arg);
+    if (buf.defined()) {
+      int64_t total_elements = 1;
+      bool all_static = true;
+      for (const PrimExpr &extent : buf->shape) {
+        const auto *imm = extent.as<IntImmNode>();
+        if (imm == nullptr) {
+          all_static = false;
+          break;
+        }
+        total_elements *= imm->value;
+      }
+      if (!all_static) {
+        LOG(FATAL) << "[ascend_vid_reduction] broadcast " << role
+                   << " has a symbolic buffer shape, so whole-buffer "
+                      "access cannot be proven; only statically shaped "
+                      "whole buffers are supported at threads=2. Pass a "
+                      "static full buffer or use threads=1.";
+      }
+      if (extent_imm->value != total_elements) {
+        LOG(FATAL) << "[ascend_vid_reduction] broadcast " << role
+                   << " is a partial BufferRegion (extent " << extent_imm->value
+                   << " of " << total_elements
+                   << " elements); region-based broadcasts cannot be "
+                      "vid-split safely (and fail even at threads=1 on "
+                      "the current baseline). Pass the full buffer or "
+                      "use threads=1.";
+      }
+    }
+  }
+
+  PrimExpr ModifyBroadcastShape(const CallNode *op) {
+    Call broadcast_call = GetRef<Call>(op);
+    Array<PrimExpr> new_args = broadcast_call->args;
+
+    const size_t dim_index = new_args[3].as<CallNode>() != nullptr ? 4 : 3;
+    const auto *dim_imm = new_args[dim_index].as<IntImmNode>();
+    ICHECK(dim_imm != nullptr)
+        << "[Error]<ascend_vid_reduction.cc>: broadcast dim must be IntImm";
+    const int64_t dim = dim_imm->value;
+    if (dim < 1 || static_cast<int64_t>(new_args.size()) <
+                       static_cast<int64_t>(dim_index + 1 + 2 * dim)) {
+      // Malformed call: leave it to the downstream validators.
+      return IRMutatorWithAnalyzer::VisitExpr_(op);
+    }
+
+    // A partial BufferRegion operand (non-zero access_ptr offset, or an
+    // extent below the buffer's full element count) cannot be split safely:
+    // the trailing shapes describe the region extent, while the halving
+    // machinery reasons about the whole buffer, and region-based broadcasts
+    // fail even at threads=1 on the clean baseline (verified: filling only
+    // dst[0:16] of a [64, 32] buffer yields ratio~0.25). Refuse at threads=2
+    // instead of emitting shapes that do not describe the real accesses.
+    CheckBroadcastOperandIsWholeBuffer(new_args[1], "destination");
+    CheckBroadcastOperandIsWholeBuffer(new_args[2], "source");
+
+    for (size_t i = 0; i < new_args.size(); ++i) {
+      new_args.Set(i, VisitExpr(new_args[i]));
+    }
+    Buffer dst_buf = ExtractBufferFromArg(new_args[1]);
+    if (dst_buf.defined() && origin_to_new_buffer_.count(dst_buf) > 0) {
+      Buffer new_dst_buf = origin_to_new_buffer_[dst_buf];
+      new_args.Set(dim_index + 1, new_dst_buf->shape[0]);
+    }
+
+    Buffer src_buf = ExtractBufferFromArg(new_args[2]);
+    if (src_buf.defined() && origin_to_new_buffer_.count(src_buf) > 0) {
+      Buffer new_src_buf = origin_to_new_buffer_[src_buf];
+      new_args.Set(dim_index + 1 + dim, new_src_buf->shape[0]);
+    }
+
+    return Call(broadcast_call->dtype, broadcast_call->op, new_args,
+                broadcast_call->span);
+  }
+
   PrimExpr VisitExpr_(const CallNode *op) final {
     if (threads_cnt_ != 2) {
       return IRMutatorWithAnalyzer::VisitExpr_(op);
@@ -796,6 +1186,13 @@ private:
     // Handle tl.ascend_reduce: modify M dimension if buffer is vid-reduced
     if (op_name == "tl.ascend_reduce") {
       return ModifyAscendReduce(op);
+    }
+
+    // Handle tl.ascend_broadcast: rebuild the trailing shape arguments
+    // from the (possibly halved) buffer shapes so the shape parameters
+    // stay consistent with the actual buffer allocations.
+    if (op_name == "tl.ascend_broadcast") {
+      return ModifyBroadcastShape(op);
     }
 
     if (op_name != "tl.ascend_copy") {
