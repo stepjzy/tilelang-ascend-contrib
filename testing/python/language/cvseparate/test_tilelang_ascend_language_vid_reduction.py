@@ -32,6 +32,7 @@ Scenarios covered (mirroring patterns from
 
 import pytest
 import tilelang
+import tvm
 import tilelang.language as T
 import torch
 
@@ -553,6 +554,324 @@ def test_no_vid_reduction_threads1_elementwise(setup_random_seed, target):
     torch.npu.synchronize()
     ref = a * 2.0 + 1.0
     torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
+
+
+# ============================================================
+# 9) Broadcast axis=0 with threads=2 (issue #2035, defect 1)
+#
+# G[K] -> src[K] (UB) -> broadcast axis=0 -> dst[BS, K] (UB) -> O[BS, K]
+# Pass: dst UB halved along rows; src UB replicated (skip set) so each
+# vid loads the full row; trailing broadcast shape args rebuilt from
+# the halved buffers; the injected tmp allocation is doubled before
+# the pass halves its zero-offset view.
+# ============================================================
+
+
+def broadcast_axis0(BS, K, threads, dtype="float32"):
+    @T.prim_func
+    def main(G: T.Tensor((K,), dtype), O: T.Tensor((BS, K), dtype)):
+        with T.Kernel(1, threads=threads, is_npu=True):
+            src = T.alloc_shared((K,), dtype)
+            dst = T.alloc_shared((BS, K), dtype)
+            T.copy(G, src)
+            T.tile.broadcast(dst, src, axis=0)
+            T.copy(dst, O)
+
+    return main
+
+
+@pytest.mark.parametrize("target", ["ascendc", pytest.param("pto", marks=pytest.mark.low_priority)])
+@pytest.mark.parametrize("threads", [1, 2])
+def test_vid_reduction_broadcast_axis0(setup_random_seed, target, threads):
+    BS, K = 64, 32
+    func = tilelang.compile(broadcast_axis0(BS, K, threads), out_idx=[1], pass_configs=pass_configs, target=target)
+    g = torch.randn(K).npu()
+    torch.npu.synchronize()
+    out = func(g)
+    torch.npu.synchronize()
+    ref = g.cpu().unsqueeze(0).expand(BS, K)
+    torch.testing.assert_close(out.cpu(), ref, rtol=1e-2, atol=1e-2)
+
+
+# ============================================================
+# 10) One-dimensional broadcast with threads=2
+#
+# G[1] -> src[1] (UB) -> broadcast -> dst[K] (UB) -> O[K]: the
+# single destination axis is a data axis and is replicated (skip
+# set); both vids compute the full broadcast and store the same
+# value to GM.
+# ============================================================
+
+
+def broadcast_1d(K, threads, dtype="float32"):
+    @T.prim_func
+    def main(G: T.Tensor((1,), dtype), O: T.Tensor((K,), dtype)):
+        with T.Kernel(1, threads=threads, is_npu=True):
+            src = T.alloc_shared((1,), dtype)
+            dst = T.alloc_shared((K,), dtype)
+            T.copy(G, src)
+            T.tile.broadcast(dst, src, axis=0)
+            T.copy(dst, O)
+
+    return main
+
+
+# Note: the PTO target is deliberately not parametrized here. A
+# one-dimensional broadcast fails on PTO even at threads=1 on the clean
+# baseline (7cd56930), i.e. a pre-existing PTO codegen issue unrelated to
+# the vid pass, which is out of scope for this fix.
+@pytest.mark.parametrize("threads", [1, 2])
+def test_vid_reduction_broadcast_1d(setup_random_seed, threads):
+    K = 64
+    func = tilelang.compile(broadcast_1d(K, threads), out_idx=[1], pass_configs=pass_configs, target="ascendc")
+    g = torch.randn(1).npu()
+    torch.npu.synchronize()
+    out = func(g)
+    torch.npu.synchronize()
+    ref = g.cpu().expand(K)
+    torch.testing.assert_close(out.cpu(), ref, rtol=1e-2, atol=1e-2)
+
+
+# ============================================================
+# 11) axis=0 broadcast with identical src/dst shapes (copy semantics)
+#
+# The frontend allows src_extent == dst_extent with axis=0 as a
+# copy-shaped broadcast. This must NOT be treated as a row
+# broadcast: both operands halve along the rows so the per-vid
+# halves stay aligned and the trailing shapes remain equal
+# (before this fix the source was replicated and the compiler
+# rejected the call: "source and destination sizes must be
+# provably equal or the source must be provably scalar").
+# ============================================================
+
+
+def broadcast_axis0_same_shape(BS, K, threads, dtype="float32"):
+    @T.prim_func
+    def main(G: T.Tensor((BS, K), dtype), O: T.Tensor((BS, K), dtype)):
+        with T.Kernel(1, threads=threads, is_npu=True):
+            src = T.alloc_shared((BS, K), dtype)
+            dst = T.alloc_shared((BS, K), dtype)
+            T.copy(G, src)
+            T.tile.broadcast(dst, src, axis=0)
+            T.copy(dst, O)
+
+    return main
+
+
+@pytest.mark.parametrize("threads", [1, 2])
+def test_vid_reduction_broadcast_axis0_same_shape(setup_random_seed, threads):
+    BS, K = 64, 32
+    func = tilelang.compile(broadcast_axis0_same_shape(BS, K, threads), out_idx=[1], pass_configs=pass_configs, target="ascendc")
+    g = torch.randn(BS, K).npu()
+    torch.npu.synchronize()
+    out = func(g)
+    torch.npu.synchronize()
+    torch.testing.assert_close(out.cpu(), g.cpu(), rtol=1e-2, atol=1e-2)
+
+
+def broadcast_1d_same_shape(K, threads, dtype="float32"):
+    @T.prim_func
+    def main(G: T.Tensor((K,), dtype), O: T.Tensor((K,), dtype)):
+        with T.Kernel(1, threads=threads, is_npu=True):
+            src = T.alloc_shared((K,), dtype)
+            dst = T.alloc_shared((K,), dtype)
+            T.copy(G, src)
+            T.tile.broadcast(dst, src, axis=0)
+            T.copy(dst, O)
+
+    return main
+
+
+@pytest.mark.parametrize("threads", [1, 2])
+def test_vid_reduction_broadcast_1d_same_shape(setup_random_seed, threads):
+    K = 64
+    func = tilelang.compile(broadcast_1d_same_shape(K, threads), out_idx=[1], pass_configs=pass_configs, target="ascendc")
+    g = torch.randn(K).npu()
+    torch.npu.synchronize()
+    out = func(g)
+    torch.npu.synchronize()
+    torch.testing.assert_close(out.cpu(), g.cpu(), rtol=1e-2, atol=1e-2)
+
+
+# ============================================================
+# 12) BufferRegion broadcast operands are rejected at threads=2
+#
+# The trailing shape arguments describe the region extent, not the
+# underlying buffer, so they cannot be rebuilt from the halved
+# buffer shape. Region-based broadcasts also fail at threads=1 on
+# the clean baseline (measured ratio~0.25), so refusing them at
+# threads=2 is protection on top of a broken base path.
+# ============================================================
+
+
+def broadcast_region_dst(BS, K, threads):
+    @T.prim_func
+    def main(G: T.Tensor((1, K), "float32"), O: T.Tensor((BS, K), "float32")):
+        with T.Kernel(1, threads=threads, is_npu=True):
+            src = T.alloc_shared((1, K), "float32")
+            dst = T.alloc_shared((BS, K), "float32")
+            T.copy(G, src)
+            T.tile.broadcast(dst[0:16, :], src, axis=0)
+            T.copy(dst, O)
+
+    return main
+
+
+@pytest.mark.parametrize("threads", [1, 2])
+def test_vid_reduction_broadcast_region_rejected(threads):
+    BS, K = 64, 32
+    if threads == 1:
+        # Known pre-existing baseline defect: a region-based broadcast
+        # produces wrong values even at threads=1 (out of scope here);
+        # only assert it still compiles so the threads=2 rejection below
+        # has a meaningful baseline.
+        tilelang.compile(broadcast_region_dst(BS, K, threads), out_idx=[1], pass_configs=pass_configs, target="ascendc")
+    else:
+        with pytest.raises(tvm.error.TVMError, match="partial BufferRegion|whole buffers"):
+            tilelang.compile(broadcast_region_dst(BS, K, threads), out_idx=[1], pass_configs=pass_configs, target="ascendc")
+
+
+def broadcast_region_src(BS, K, threads):
+    @T.prim_func
+    def main(G: T.Tensor((BS, 8), "float32"), O: T.Tensor((BS, K), "float32")):
+        with T.Kernel(1, threads=threads, is_npu=True):
+            src = T.alloc_shared((BS, 8), "float32")
+            dst = T.alloc_shared((BS, K), "float32")
+            T.copy(G, src)
+            T.tile.broadcast(dst, src[:, 0:1], axis=1)
+            T.copy(dst, O)
+
+    return main
+
+
+@pytest.mark.parametrize("threads", [1, 2])
+def test_vid_reduction_broadcast_region_src_rejected(threads):
+    BS, K = 64, 32
+    if threads == 1:
+        tilelang.compile(broadcast_region_src(BS, K, threads), out_idx=[1], pass_configs=pass_configs, target="ascendc")
+    else:
+        with pytest.raises(tvm.error.TVMError, match="partial BufferRegion|whole buffers"):
+            tilelang.compile(broadcast_region_src(BS, K, threads), out_idx=[1], pass_configs=pass_configs, target="ascendc")
+
+
+# ============================================================
+# 13) axis=1 broadcast: known pre-existing baseline defect
+#
+# The canonical axis=1 shape ([M,1] -> [M,N]) moves a [M,1] tile
+# through GM with a 4-byte DMA block length, below the 32-byte
+# alignment CANN requires, and yields wrong values even at
+# threads=1 on the clean baseline (two constructions verified,
+# including a padded region source). This is a baseline data-path
+# defect outside the vid pass; the case is documented as xfail
+# rather than silently skipped.
+# ============================================================
+
+
+def broadcast_axis1(BS, K, threads):
+    @T.prim_func
+    def main(G: T.Tensor((BS, 1), "float32"), O: T.Tensor((BS, K), "float32")):
+        with T.Kernel(1, threads=threads, is_npu=True):
+            src = T.alloc_shared((BS, 1), "float32")
+            dst = T.alloc_shared((BS, K), "float32")
+            T.copy(G, src)
+            T.tile.broadcast(dst, src, axis=1)
+            T.copy(dst, O)
+
+    return main
+
+
+@pytest.mark.xfail(
+    reason="pre-existing axis=1 broadcast defect at threads=1 on the clean baseline (DMA block length below 32B alignment); out of scope for the vid broadcast fix"
+)
+@pytest.mark.parametrize("threads", [1, 2])
+def test_vid_reduction_broadcast_axis1_known_baseline_defect(setup_random_seed, threads):
+    BS, K = 64, 32
+    func = tilelang.compile(broadcast_axis1(BS, K, threads), out_idx=[1], pass_configs=pass_configs, target="ascendc")
+    g = torch.randn(BS, 1).npu()
+    torch.npu.synchronize()
+    out = func(g)
+    torch.npu.synchronize()
+    torch.testing.assert_close(out.cpu(), g.cpu().expand(BS, K), rtol=1e-2, atol=1e-2)
+
+
+# ============================================================
+# 14) Explicit tmp workspace
+#
+# The vid pass halves a zero-offset tmp view, so a threads=1-sized
+# arena is only half of what each vid needs, and a region-offset
+# arena points past the halved allocation. Whole-buffer arenas
+# must therefore be sized for both halves, and region arenas are
+# rejected.
+# ============================================================
+
+
+def broadcast_explicit_tmp(BS, K, threads, tmp_bytes):
+    @T.prim_func
+    def main(G: T.Tensor((K,), "float32"), O: T.Tensor((BS, K), "float32")):
+        with T.Kernel(1, threads=threads, is_npu=True):
+            src = T.alloc_shared((K,), "float32")
+            dst = T.alloc_shared((BS, K), "float32")
+            tmp = T.alloc_ub((tmp_bytes,), "uint8")
+            T.copy(G, src)
+            T.tile.broadcast(dst, src, axis=0, tmp=tmp)
+            T.copy(dst, O)
+
+    return main
+
+
+@pytest.mark.parametrize("threads", [1, 2])
+def test_vid_reduction_broadcast_explicit_tmp_sized_for_vids(setup_random_seed, threads):
+    BS, K = 64, 32
+    # 32 bytes is the per-vid staging estimate; the arena must hold both
+    # halves at threads=2.
+    func = tilelang.compile(broadcast_explicit_tmp(BS, K, threads, 64), out_idx=[1], pass_configs=pass_configs, target="ascendc")
+    g = torch.randn(K).npu()
+    torch.npu.synchronize()
+    out = func(g)
+    torch.npu.synchronize()
+    torch.testing.assert_close(out.cpu(), g.cpu().unsqueeze(0).expand(BS, K), rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("threads", [1, 2])
+def test_vid_reduction_broadcast_explicit_tmp_too_small_rejected(threads):
+    BS, K = 64, 32
+    if threads == 1:
+        func = tilelang.compile(broadcast_explicit_tmp(BS, K, threads, 32), out_idx=[1], pass_configs=pass_configs, target="ascendc")
+        g = torch.randn(K).npu()
+        out = func(g)
+        torch.npu.synchronize()
+        torch.testing.assert_close(out.cpu(), g.cpu().unsqueeze(0).expand(BS, K), rtol=1e-2, atol=1e-2)
+    else:
+        with pytest.raises(tvm.error.TVMError, match="too small for threads=2"):
+            tilelang.compile(broadcast_explicit_tmp(BS, K, threads, 32), out_idx=[1], pass_configs=pass_configs, target="ascendc")
+
+
+def broadcast_explicit_tmp_region(BS, K, threads):
+    @T.prim_func
+    def main(G: T.Tensor((K,), "float32"), O: T.Tensor((BS, K), "float32")):
+        with T.Kernel(1, threads=threads, is_npu=True):
+            src = T.alloc_shared((K,), "float32")
+            dst = T.alloc_shared((BS, K), "float32")
+            arena = T.alloc_ub((64,), "uint8")
+            T.copy(G, src)
+            T.tile.broadcast(dst, src, axis=0, tmp=arena[32:64])
+            T.copy(dst, O)
+
+    return main
+
+
+@pytest.mark.parametrize("threads", [1, 2])
+def test_vid_reduction_broadcast_explicit_tmp_region_rejected(threads):
+    BS, K = 64, 32
+    if threads == 1:
+        func = tilelang.compile(broadcast_explicit_tmp_region(BS, K, threads), out_idx=[1], pass_configs=pass_configs, target="ascendc")
+        g = torch.randn(K).npu()
+        out = func(g)
+        torch.npu.synchronize()
+        torch.testing.assert_close(out.cpu(), g.cpu().unsqueeze(0).expand(BS, K), rtol=1e-2, atol=1e-2)
+    else:
+        with pytest.raises(tvm.error.TVMError, match="BufferRegion with byte offset"):
+            tilelang.compile(broadcast_explicit_tmp_region(BS, K, threads), out_idx=[1], pass_configs=pass_configs, target="ascendc")
 
 
 if __name__ == "__main__":
